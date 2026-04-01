@@ -1,0 +1,49 @@
+name: Weekly Repo Summary Report
+
+on:
+  schedule:
+    # Run every Monday at 09:00 UTC
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: "Number of days to look back (overrides config.json)"
+        required: false
+        default: "7"
+
+permissions:
+  contents: write   # needed to commit updated state/last_check.json
+  issues: write     # needed to create the summary issue
+
+jobs:
+  weekly-report:
+    name: Generate Weekly Summary
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run RepoWatchDog
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPORT_OWNER: ${{ github.repository_owner }}
+          REPORT_REPO: ${{ github.event.repository.name }}
+          LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days }}
+        run: python scripts/watch_dog.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/last_check.json
+          git diff --cached --quiet || git commit -m "chore: update watch state [skip ci]"
+          git push
