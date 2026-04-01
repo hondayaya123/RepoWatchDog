@@ -6,7 +6,7 @@ It tracks:
 - 🚀 **New Releases** – what changed, release notes included
 - 🐛 **New Issues** – newly opened issues with labels and state
 
-> Default target repo: [`github/copilot-extensions`](https://github.com/github/copilot-extensions) (GitHub Copilot SDK) — fully configurable.
+> Default target repo: [`github/copilot-sdk`](https://github.com/github/copilot-sdk) (GitHub Copilot SDK) — fully configurable.
 
 ---
 
@@ -38,8 +38,8 @@ Edit `config.json`:
   "watch_repos": [
     {
       "owner": "github",
-      "repo": "copilot-extensions",
-      "description": "GitHub Copilot Extensions SDK"
+      "repo": "copilot-sdk",
+      "description": "GitHub Copilot SDK"
     }
   ],
   "report_repo": {
@@ -118,7 +118,7 @@ RepoWatchDog/
 
 ---
 
-## 🔍 github/copilot-extensions
+## 🔍 github/copilot-sdk
 
 ### 🚀 New Releases (1)
 

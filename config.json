@@ -2,8 +2,8 @@
   "watch_repos": [
     {
       "owner": "github",
-      "repo": "copilot-extensions",
-      "description": "GitHub Copilot Extensions SDK"
+      "repo": "copilot-sdk",
+      "description": "GitHub Copilot SDK"
     }
   ],
   "report_repo": {
