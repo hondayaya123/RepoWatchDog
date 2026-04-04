@@ -534,7 +534,8 @@ def _extract_item_summary(item: dict, item_type: str, max_chars: int = 120) -> s
         elif item_type == "release":
             parts.append("新版本發布")
 
-    return "　".join(parts) if parts else ""
+    # Use ideographic space (U+3000) as separator for Traditional Chinese formatting
+    return "\u3000".join(parts) if parts else ""
 
 
 def _generate_user_tips(
