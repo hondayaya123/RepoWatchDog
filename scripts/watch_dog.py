@@ -14,6 +14,7 @@ Environment variables:
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -35,6 +36,23 @@ OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 DEFAULT_LLM_MODEL = "gpt-4o-mini"
 DEFAULT_LLM_TECH_STACK = "general software development"
 DEFAULT_LLM_FOCUS_AREAS = "breaking changes, new features, performance improvements, security vulnerabilities"
+
+# Keywords that mark an item as a critical change (case-insensitive substring match)
+_BREAKING_KEYWORDS: dict[str, int] = {
+    "security": 3,
+    "cve": 3,
+    "breaking change": 2,
+    "breaking-change": 2,
+    "breaking": 2,
+    "remove": 1,
+    "removed": 1,
+    "deprecate": 1,
+    "deprecated": 1,
+    "migration": 1,
+    "priority/high": 1,
+}
+
+MAX_COMPACT_ITEMS = 10
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -209,8 +227,270 @@ def _parse_dt(dt_str: str) -> datetime:
 
 
 # ---------------------------------------------------------------------------
-# LLM summarization (direct OpenAI API – configurable via config.json + OPENAI_API_KEY)
+# Compact summary – rule-based critical change detection (no LLM required)
 # ---------------------------------------------------------------------------
+
+
+def _is_major_version_bump(tag: str) -> bool:
+    """Return True when *tag* looks like a major-version release (vX.0.0 / X.0.0)."""
+    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", tag)
+    if m:
+        major, minor, patch_ver = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        return major > 0 and minor == 0 and patch_ver == 0
+    return False
+
+
+def _compute_severity(title: str, labels: list[str]) -> int:
+    """Return highest severity score from keyword matching on title + labels."""
+    text = (title + " " + " ".join(labels)).lower()
+    score = 0
+    for keyword, sev in _BREAKING_KEYWORDS.items():
+        if keyword in text:
+            score = max(score, sev)
+    return score
+
+
+def _item_severity(item: dict, item_type: str) -> int:
+    """Return the severity score for a release, PR, or issue dict."""
+    title = item.get("title") or item.get("name") or item.get("tag_name") or ""
+    labels = [lbl["name"] for lbl in item.get("labels", [])]
+    score = _compute_severity(title, labels)
+    if item_type == "release":
+        tag = item.get("tag_name", "")
+        if _is_major_version_bump(tag):
+            score = max(score, 2)
+        # Also scan first 500 chars of release body
+        body = (item.get("body") or "")[:500]
+        score = max(score, _compute_severity(body, []))
+    return score
+
+
+def filter_critical_changes(
+    releases: list[dict],
+    prs: list[dict],
+    issues: list[dict],
+    max_items: int = MAX_COMPACT_ITEMS,
+) -> list[dict]:
+    """Return up to *max_items* critical changes, sorted by severity (highest first).
+
+    Each returned dict has keys: ``type`` (str), ``severity`` (int), ``item`` (dict).
+    """
+    candidates: list[dict] = []
+
+    for r in releases:
+        sev = _item_severity(r, "release")
+        if sev > 0:
+            candidates.append({"type": "release", "severity": sev, "item": r})
+
+    for pr in prs:
+        sev = _item_severity(pr, "pr")
+        if sev > 0:
+            candidates.append({"type": "pr", "severity": sev, "item": pr})
+
+    for issue in issues:
+        sev = _item_severity(issue, "issue")
+        if sev > 0:
+            candidates.append({"type": "issue", "severity": sev, "item": issue})
+
+    candidates.sort(key=lambda x: x["severity"], reverse=True)
+    return candidates[:max_items]
+
+
+def _get_impact_and_action(item: dict, item_type: str, severity: int) -> tuple[str, str]:
+    """Return (影響, 我需要做) using simple keyword rules – no LLM needed."""
+    title = item.get("title") or item.get("name") or item.get("tag_name") or ""
+    labels = [lbl["name"] for lbl in item.get("labels", [])]
+    text = (title + " " + " ".join(labels)).lower()
+
+    if "security" in text or "cve" in text:
+        return "存在安全漏洞，可能影響系統安全性", "立即更新至最新版本，並確認系統是否受到影響"
+    if "breaking change" in text or "breaking-change" in text or "breaking" in text:
+        return "API 或行為有破壞性變更，可能導致現有程式碼失效", "閱讀 migration guide 並在測試環境驗證後再升級"
+    if "deprecate" in text or "deprecated" in text:
+        return "功能已標記為廢棄，未來版本將移除", "規劃遷移至官方推薦的替代方案"
+    if "remove" in text or "removed" in text:
+        return "功能或 API 已被移除，繼續使用將導致錯誤", "立即更新程式碼以移除對此功能的依賴"
+    if "migration" in text:
+        return "需要執行資料或配置遷移", "依照 migration guide 完成遷移步驟"
+    if item_type == "release" and _is_major_version_bump(item.get("tag_name", "")):
+        return "主要版本升級，可能含有破壞性變更", "閱讀 CHANGELOG，評估影響後安排升級計畫"
+    if "priority/high" in text:
+        return "高優先度問題，可能影響系統穩定性", "評估影響範圍並安排修復"
+    return "有顯著變更，需評估對專案的影響", "閱讀詳細說明，確認是否需要採取行動"
+
+
+def _generate_risks(
+    critical: list[dict],
+    all_releases: list[dict],
+) -> list[str]:
+    """Return up to 3 rule-based risk statements in Traditional Chinese."""
+    risks: list[str] = []
+    has_security = any(c["severity"] >= 3 for c in critical)
+    has_breaking = any(c["severity"] == 2 for c in critical)
+    has_deprecation = any(
+        "deprecat" in ((c["item"].get("title") or c["item"].get("name") or "")).lower()
+        for c in critical
+    )
+
+    if has_security:
+        risks.append("存在安全漏洞，若未及時修補可能導致系統遭受攻擊或資料外洩")
+    if has_breaking:
+        risks.append("破壞性變更可能使現有整合失效，升級前請在測試環境充分驗證")
+    if has_deprecation:
+        risks.append("部分功能已廢棄，建議在下次重構時一併完成遷移，避免未來被強制升級")
+    if len(all_releases) > 3:
+        risks.append(f"本週共有 {len(all_releases)} 個新版本發布，建議評估統一升級的時機以降低維護成本")
+    if not risks:
+        risks.append("本週無明顯高風險項目，建議持續追蹤後續更新")
+    return risks[:3]
+
+
+def _generate_actions(
+    critical: list[dict],
+    all_releases: list[dict],
+    all_prs: list[dict],
+    all_issues: list[dict],
+) -> list[str]:
+    """Return exactly 3 actionable checklist items in Traditional Chinese."""
+    actions: list[str] = []
+    has_security = any(c["severity"] >= 3 for c in critical)
+    has_breaking = any(c["severity"] == 2 for c in critical)
+
+    if has_security:
+        actions.append("優先安裝含安全修補的最新版本，並確認系統未受已知漏洞影響")
+    if has_breaking:
+        actions.append("閱讀破壞性變更的 migration guide，並於測試環境完成驗證後再上線")
+    if critical:
+        actions.append("在 GitHub 上訂閱上述重大變更的通知，追蹤後續修補進展")
+    if len(actions) < 3:
+        actions.append("定期檢視相依套件版本，保持在安全且受支援的版本範圍內")
+    if len(actions) < 3:
+        actions.append("若本週無重大影響，可規劃於下次維護窗口統一升級非緊急依賴")
+    return actions[:3]
+
+
+def build_compact_report(
+    watch_repos: list[dict],
+    token: str,
+    since: datetime,
+    important_labels: list[str] | None = None,
+) -> str:
+    """Build a compact Traditional-Chinese report highlighting only critical changes.
+
+    No LLM or paid API is required – all logic is rule-based.
+    """
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    since_str = since.strftime("%Y-%m-%d %H:%M UTC")
+
+    all_releases: list[dict] = []
+    all_prs: list[dict] = []
+    all_issues: list[dict] = []
+
+    for entry in watch_repos:
+        owner = entry["owner"]
+        repo = entry["repo"]
+        try:
+            prs = fetch_merged_prs(owner, repo, token, since)
+            releases = fetch_releases(owner, repo, token, since)
+            issues = fetch_issues(owner, repo, token, since, important_labels)
+            repo_label = f"{owner}/{repo}"
+            for x in prs:
+                x["_repo"] = repo_label
+            for x in releases:
+                x["_repo"] = repo_label
+            for x in issues:
+                x["_repo"] = repo_label
+            all_prs.extend(prs)
+            all_releases.extend(releases)
+            all_issues.extend(issues)
+        except requests.HTTPError as exc:
+            print(f"⚠️ Failed to fetch {owner}/{repo}: {exc}", file=sys.stderr)
+
+    critical = filter_critical_changes(all_releases, all_prs, all_issues)
+    total_changes = len(all_releases) + len(all_prs) + len(all_issues)
+    repos_str = "、".join(f"{e['owner']}/{e['repo']}" for e in watch_repos)
+
+    # One-line summary
+    if not critical:
+        summary = f"本週監測 {repos_str}，共 {total_changes} 項更新，**無發現重大變更**。"
+    else:
+        sev3 = sum(1 for c in critical if c["severity"] >= 3)
+        sev2 = sum(1 for c in critical if c["severity"] == 2)
+        rest = len(critical) - sev3 - sev2
+        parts: list[str] = []
+        if sev3:
+            parts.append(f"{sev3} 項安全性問題")
+        if sev2:
+            parts.append(f"{sev2} 項破壞性變更")
+        if rest:
+            parts.append(f"{rest} 項重要更新")
+        changes_summary = "、".join(parts)
+        summary = f"本週監測 {repos_str}，共 {total_changes} 項更新，發現 {changes_summary}，請優先處理。"
+
+    sections: list[str] = [
+        "# 📦 RepoWatchDog 週報摘要",
+        "",
+        f"**報告時間：** {now_str}",
+        f"**涵蓋期間：** {since_str} → {now_str}",
+        "",
+        summary,
+        "",
+    ]
+
+    # ── 🔥 重大變更 ──────────────────────────────────────────────────────────
+    sections.append("## 🔥 重大變更")
+    sections.append("")
+
+    if not critical:
+        sections.append("_本週無重大變更。_")
+        sections.append("")
+    else:
+        for idx, entry in enumerate(critical, 1):
+            item = entry["item"]
+            item_type = entry["type"]
+            severity = entry["severity"]
+
+            title = item.get("title") or item.get("name") or item.get("tag_name") or ""
+            url = item.get("html_url", "")
+            repo_label = item.get("_repo", "")
+
+            if severity >= 3:
+                badge = "🔴 安全"
+            elif severity == 2:
+                badge = "🟠 破壞性"
+            else:
+                badge = "🟡 重要"
+
+            impact, action = _get_impact_and_action(item, item_type, severity)
+
+            sections.append(f"### {idx}. [{badge}] {title}")
+            sections.append("")
+            sections.append(f"- **影響：** {impact}")
+            sections.append(f"- **我需要做：** {action}")
+            sections.append(f"- **參考連結：** [{repo_label}]({url})")
+            sections.append("")
+
+    # ── 🛡️ 風險與注意事項 ────────────────────────────────────────────────────
+    sections.append("## 🛡️ 風險與注意事項")
+    sections.append("")
+    for i, risk in enumerate(_generate_risks(critical, all_releases), 1):
+        sections.append(f"{i}. {risk}")
+    sections.append("")
+
+    # ── ✅ 建議行動 checklist ─────────────────────────────────────────────────
+    sections.append("## ✅ 建議行動")
+    sections.append("")
+    for action_item in _generate_actions(critical, all_releases, all_prs, all_issues):
+        sections.append(f"- [ ] {action_item}")
+    sections.append("")
+
+    sections.append("---")
+    sections.append("")
+    sections.append(
+        "_Generated by [RepoWatchDog](https://github.com/hondayaya123/RepoWatchDog)_ 🐶"
+    )
+
+    return "\n".join(sections)
 
 _LLM_PROMPT_TEMPLATE = """\
 # Role
@@ -560,6 +840,9 @@ def main() -> None:
     )
     ai_summary_enabled: bool = bool(config.get("ai_summary", False))
     llm_config: dict | None = config.get("llm") or None
+    # compact_summary: True (default) → use rule-based compact report in Traditional Chinese
+    # compact_summary: False → use the full verbose report (original behaviour)
+    compact_summary: bool = bool(config.get("compact_summary", True))
 
     # Allow env var to override lookback_days (used by workflow_dispatch)
     if os.environ.get("LOOKBACK_DAYS"):
@@ -583,18 +866,25 @@ def main() -> None:
     print(f"Fetching activity since {since.isoformat()} ...")
 
     llm_api_key = os.environ.get("OPENAI_API_KEY", "")
-    if llm_api_key and llm_config is not None:
-        print(f"🤖 LLM summarization enabled (model: {llm_config.get('model', DEFAULT_LLM_MODEL)})")
-    else:
-        print("ℹ️  LLM summarization disabled – set OPENAI_API_KEY and configure 'llm' in config.json to enable.")
 
-    report_body = build_report(
-        watch_repos, token, since,
-        important_labels=important_labels or None,
-        ai_summary=ai_summary_enabled,
-        llm_config=llm_config,
-        llm_api_key=llm_api_key,
-    )
+    if compact_summary:
+        print("📋 精簡摘要模式（compact_summary=true）：僅列重大變更，無需 LLM。")
+        report_body = build_compact_report(
+            watch_repos, token, since,
+            important_labels=important_labels or None,
+        )
+    else:
+        if llm_api_key and llm_config is not None:
+            print(f"🤖 LLM summarization enabled (model: {llm_config.get('model', DEFAULT_LLM_MODEL)})")
+        else:
+            print("ℹ️  LLM summarization disabled – set OPENAI_API_KEY and configure 'llm' in config.json to enable.")
+        report_body = build_report(
+            watch_repos, token, since,
+            important_labels=important_labels or None,
+            ai_summary=ai_summary_enabled,
+            llm_config=llm_config,
+            llm_api_key=llm_api_key,
+        )
 
     now = datetime.now(timezone.utc)
     week_str = now.strftime("%G-W%V")  # ISO 8601 week date (e.g. 2024-W25)

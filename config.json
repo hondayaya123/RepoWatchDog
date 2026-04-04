@@ -12,6 +12,7 @@
   },
   "lookback_days": 7,
   "important_labels": ["bug", "enhancement", "breaking change", "priority/high"],
+  "compact_summary": true,
   "ai_summary": true,
   "llm": {
     "model": "gpt-4o-mini",
