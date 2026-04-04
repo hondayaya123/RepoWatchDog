@@ -856,12 +856,28 @@ def main() -> None:
         print("No watch_repos configured. Exiting.", file=sys.stderr)
         sys.exit(1)
 
+    # Detect whether this run was triggered manually (workflow_dispatch) or by
+    # the scheduler.  GITHUB_EVENT_NAME is set automatically by GitHub Actions;
+    # when running locally it defaults to "schedule" so existing behaviour is
+    # preserved.
+    is_manual = os.environ.get("GITHUB_EVENT_NAME", "schedule") == "workflow_dispatch"
+
     # Determine look-back window
-    since = load_state(state_path)
-    # Clamp to configured max lookback
-    earliest = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-    if since < earliest:
-        since = earliest
+    now = datetime.now(timezone.utc)
+    if is_manual:
+        # Manual runs always look back exactly <lookback_days> days from now,
+        # ignoring whatever timestamp is stored in the state file.
+        since = now - timedelta(days=lookback_days)
+        print(
+            f"⚡ Manual trigger detected – ignoring state file, "
+            f"looking back {lookback_days} day(s)."
+        )
+    else:
+        since = load_state(state_path)
+        # Clamp to configured max lookback
+        earliest = now - timedelta(days=lookback_days)
+        if since < earliest:
+            since = earliest
 
     print(f"Fetching activity since {since.isoformat()} ...")
 
@@ -886,7 +902,6 @@ def main() -> None:
             llm_api_key=llm_api_key,
         )
 
-    now = datetime.now(timezone.utc)
     week_str = now.strftime("%G-W%V")  # ISO 8601 week date (e.g. 2024-W25)
     issue_title = f"[RepoWatchDog] Weekly Summary {week_str}"
 
@@ -905,8 +920,11 @@ def main() -> None:
             "ℹ️  REPORT_OWNER / REPORT_REPO not configured – report printed to stdout only."
         )
 
-    save_state(state_path, now)
-    print("State updated.")
+    if is_manual:
+        print("⚡ Manual trigger – state file NOT updated (last_check.json preserved).")
+    else:
+        save_state(state_path, now)
+        print("State updated.")
 
 
 if __name__ == "__main__":

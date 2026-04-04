@@ -42,6 +42,7 @@ jobs:
         run: python scripts/watch_dog.py
 
       - name: Commit updated state
+        if: github.event_name == 'schedule'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
