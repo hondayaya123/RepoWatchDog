@@ -235,8 +235,8 @@ def _is_major_version_bump(tag: str) -> bool:
     """Return True when *tag* looks like a major-version release (vX.0.0 / X.0.0)."""
     m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", tag)
     if m:
-        major, minor, patch_ = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        return major > 0 and minor == 0 and patch_ == 0
+        major, minor, patch_ver = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        return major > 0 and minor == 0 and patch_ver == 0
     return False
 
 
@@ -314,7 +314,7 @@ def _get_impact_and_action(item: dict, item_type: str, severity: int) -> tuple[s
         return "需要執行資料或配置遷移", "依照 migration guide 完成遷移步驟"
     if item_type == "release" and _is_major_version_bump(item.get("tag_name", "")):
         return "主要版本升級，可能含有破壞性變更", "閱讀 CHANGELOG，評估影響後安排升級計畫"
-    if "priority/high" in labels:
+    if "priority/high" in text:
         return "高優先度問題，可能影響系統穩定性", "評估影響範圍並安排修復"
     return "有顯著變更，需評估對專案的影響", "閱讀詳細說明，確認是否需要採取行動"
 
@@ -424,7 +424,8 @@ def build_compact_report(
             parts.append(f"{sev2} 項破壞性變更")
         if rest:
             parts.append(f"{rest} 項重要更新")
-        summary = f"本週監測 {repos_str}，共 {total_changes} 項更新，發現 {'、'.join(parts)}，請優先處理。"
+        changes_summary = "、".join(parts)
+        summary = f"本週監測 {repos_str}，共 {total_changes} 項更新，發現 {changes_summary}，請優先處理。"
 
     sections: list[str] = [
         "# 📦 RepoWatchDog 週報摘要",
