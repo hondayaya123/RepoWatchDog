@@ -15,11 +15,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from watch_dog import (
     _build_llm_prompt,
+    _compute_severity,
+    _is_major_version_bump,
     _parse_dt,
+    build_compact_report,
     build_report,
     fetch_commit_stats,
     fetch_issues,
     fetch_merged_prs,
+    filter_critical_changes,
     generate_ai_summary,
     load_state,
     save_state,
@@ -527,6 +531,7 @@ def test_lookback_days_env_override(tmp_path, monkeypatch):
         "lookback_days": 7,  # config says 7, env says 14
         "important_labels": [],
         "ai_summary": False,
+        "compact_summary": False,  # use full report so build_report is called
     }
     cfg_path = tmp_path / "config.json"
     cfg_path.write_text(json.dumps(config))
@@ -651,3 +656,202 @@ def test_build_report_without_llm_key_uses_raw(mock_get):
     # Raw release and issue info should appear
     assert "v1.2.3" in report
     assert "Something is broken" in report
+
+
+# ---------------------------------------------------------------------------
+# _is_major_version_bump
+# ---------------------------------------------------------------------------
+
+
+def test_is_major_version_bump_v2_0_0():
+    assert _is_major_version_bump("v2.0.0") is True
+
+
+def test_is_major_version_bump_no_v_prefix():
+    assert _is_major_version_bump("3.0.0") is True
+
+
+def test_is_major_version_bump_minor_not_zero():
+    assert _is_major_version_bump("v2.1.0") is False
+
+
+def test_is_major_version_bump_patch_not_zero():
+    assert _is_major_version_bump("v2.0.1") is False
+
+
+def test_is_major_version_bump_v0_is_not_major():
+    # v0.x.0 is typically pre-release, not a major bump
+    assert _is_major_version_bump("v0.1.0") is False
+
+
+def test_is_major_version_bump_non_semver():
+    assert _is_major_version_bump("latest") is False
+
+
+# ---------------------------------------------------------------------------
+# _compute_severity
+# ---------------------------------------------------------------------------
+
+
+def test_compute_severity_security_keyword():
+    assert _compute_severity("Security fix for CVE-2024-1234", []) == 3
+
+
+def test_compute_severity_cve_in_label():
+    assert _compute_severity("Some release", ["CVE"]) == 3
+
+
+def test_compute_severity_breaking_change():
+    assert _compute_severity("breaking change in API", []) == 2
+
+
+def test_compute_severity_deprecate():
+    assert _compute_severity("Deprecate old endpoint", []) == 1
+
+
+def test_compute_severity_no_match():
+    assert _compute_severity("Minor documentation update", []) == 0
+
+
+def test_compute_severity_highest_wins():
+    # Both security (3) and breaking (2) present – should return 3
+    assert _compute_severity("Security breaking change", []) == 3
+
+
+# ---------------------------------------------------------------------------
+# filter_critical_changes
+# ---------------------------------------------------------------------------
+
+MOCK_SECURITY_RELEASE = {
+    "tag_name": "v1.2.4",
+    "name": "Security Fix",
+    "title": "Security patch CVE-2024-9999",
+    "html_url": "https://github.com/example/repo/releases/tag/v1.2.4",
+    "published_at": "2024-06-12T10:00:00Z",
+    "draft": False,
+    "body": "Security fix for CVE-2024-9999",
+    "labels": [],
+}
+
+MOCK_BREAKING_PR = {
+    "number": 20,
+    "title": "Breaking change: remove old API",
+    "html_url": "https://github.com/example/repo/pull/20",
+    "merged_at": "2024-06-11T09:00:00Z",
+    "user": {"login": "octocat"},
+    "labels": [],
+}
+
+MOCK_NORMAL_PR = {
+    "number": 21,
+    "title": "Update README",
+    "html_url": "https://github.com/example/repo/pull/21",
+    "merged_at": "2024-06-11T10:00:00Z",
+    "user": {"login": "octocat"},
+    "labels": [],
+}
+
+
+def test_filter_critical_changes_returns_only_critical():
+    result = filter_critical_changes(
+        releases=[MOCK_SECURITY_RELEASE],
+        prs=[MOCK_BREAKING_PR, MOCK_NORMAL_PR],
+        issues=[],
+    )
+    titles = [e["item"].get("name") or e["item"].get("title") for e in result]
+    assert "Security Fix" in titles
+    assert "Breaking change: remove old API" in titles
+    # Normal PR should be excluded
+    assert not any("Update README" in (t or "") for t in titles)
+
+
+def test_filter_critical_changes_sorted_by_severity():
+    result = filter_critical_changes(
+        releases=[MOCK_SECURITY_RELEASE],
+        prs=[MOCK_BREAKING_PR],
+        issues=[],
+    )
+    # Security (3) should come before breaking (2)
+    assert result[0]["severity"] >= result[-1]["severity"]
+    assert result[0]["severity"] == 3
+
+
+def test_filter_critical_changes_respects_max_items():
+    many_breaking_prs = [
+        {**MOCK_BREAKING_PR, "number": i, "title": f"Breaking change #{i}"}
+        for i in range(20)
+    ]
+    result = filter_critical_changes(releases=[], prs=many_breaking_prs, issues=[], max_items=5)
+    assert len(result) == 5
+
+
+def test_filter_critical_changes_major_release_included():
+    major_release = {
+        "tag_name": "v2.0.0",
+        "name": "Version 2.0.0",
+        "html_url": "https://github.com/example/repo/releases/tag/v2.0.0",
+        "published_at": "2024-06-10T10:00:00Z",
+        "draft": False,
+        "body": "",
+        "labels": [],
+    }
+    result = filter_critical_changes(releases=[major_release], prs=[], issues=[])
+    assert len(result) == 1
+    assert result[0]["severity"] == 2
+
+
+def test_filter_critical_changes_empty_inputs():
+    result = filter_critical_changes(releases=[], prs=[], issues=[])
+    assert result == []
+
+
+# ---------------------------------------------------------------------------
+# build_compact_report
+# ---------------------------------------------------------------------------
+
+
+@patch("watch_dog.requests.get")
+def test_build_compact_report_structure(mock_get):
+    since = datetime(2024, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
+    watch_repos = [{"owner": "example", "repo": "repo", "description": "Test repo"}]
+
+    mock_get.side_effect = [
+        _make_response([MOCK_BREAKING_PR]),   # merged PRs page 1
+        _make_response([]),                   # merged PRs page 2
+        _make_response([MOCK_SECURITY_RELEASE]),  # releases page 1
+        _make_response([]),                   # releases page 2
+        _make_response([MOCK_ISSUE]),         # issues page 1
+        _make_response([]),                   # issues page 2
+    ]
+
+    report = build_compact_report(watch_repos, token="fake", since=since)
+
+    assert "# 📦 RepoWatchDog 週報摘要" in report
+    assert "## 🔥 重大變更" in report
+    assert "## 🛡️ 風險與注意事項" in report
+    assert "## ✅ 建議行動" in report
+    # At least one action item checkbox
+    assert "- [ ]" in report
+    # Summary line should be in Traditional Chinese
+    assert "本週監測" in report
+
+
+@patch("watch_dog.requests.get")
+def test_build_compact_report_no_critical_changes(mock_get):
+    since = datetime(2024, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
+    watch_repos = [{"owner": "example", "repo": "repo", "description": "Test repo"}]
+
+    mock_get.side_effect = [
+        _make_response([MOCK_PR]),     # merged PRs page 1 (normal PR, not critical)
+        _make_response([]),            # merged PRs page 2
+        _make_response([MOCK_RELEASE]),  # releases page 1 (v1.2.3, not major)
+        _make_response([]),            # releases page 2
+        _make_response([]),            # issues page 1 (no issues)
+        _make_response([]),            # issues page 2
+    ]
+
+    report = build_compact_report(watch_repos, token="fake", since=since)
+
+    assert "本週無重大變更" in report
+    assert "## 🔥 重大變更" in report
+
