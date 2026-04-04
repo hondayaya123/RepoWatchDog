@@ -31,6 +31,10 @@ except ImportError:
 
 MAX_RELEASE_BODY_LENGTH = 1000
 LABEL_COLOR = "0075ca"  # GitHub's default blue used for informational labels
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+DEFAULT_LLM_MODEL = "gpt-4o-mini"
+DEFAULT_LLM_TECH_STACK = "general software development"
+DEFAULT_LLM_FOCUS_AREAS = "breaking changes, new features, performance improvements, security vulnerabilities"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -205,6 +209,75 @@ def _parse_dt(dt_str: str) -> datetime:
 
 
 # ---------------------------------------------------------------------------
+# LLM summarization (direct OpenAI API – configurable via config.json + OPENAI_API_KEY)
+# ---------------------------------------------------------------------------
+
+_LLM_PROMPT_TEMPLATE = """\
+# Role
+你是一位資深的軟體技術分析師，擅長將複雜的 GitHub 技術文件簡化為易於理解的商業與技術決策摘要。
+
+# Task
+請分析以下來自 GitHub 的 Release Note 與 Issue 討論，並針對我的需求進行篩選與彙總。
+
+# My Context (我的背景與關注點)
+- 我主要關注的技術棧：{tech_stack}
+- 我在意的事：{focus_areas}
+- 閱讀偏好：請避開艱澀的程式碼細節，用直白的話解釋這些變更對我的專案或開發流程有什麼實質影響。
+
+# Output Requirements
+請按以下結構輸出：
+1. 🔥 重大變更 (必須注意)：列出會導致程式出錯或需要大幅改動的部分。
+2. ✨ 重點新功能：挑選 2-3 個最具代表性的功能，並說明用途。
+3. 🛠️ 效能與修復：簡述是否有顯著的優化。
+4. 💡 專家建議：根據這些變更，我現在應該「立刻更新」、「再等等」還是「手動調整某個設定」？
+
+# Input Data
+{raw_content}\
+"""
+
+
+def _build_llm_prompt(raw_content: str, tech_stack: str, focus_areas: str) -> str:
+    """Return the filled-in LLM prompt for a single repository's raw data."""
+    return _LLM_PROMPT_TEMPLATE.format(
+        tech_stack=tech_stack,
+        focus_areas=focus_areas,
+        raw_content=raw_content,
+    )
+
+
+def summarize_with_llm(raw_content: str, llm_config: dict, api_key: str) -> str:
+    """Call the OpenAI Chat Completions API and return the LLM-generated summary.
+
+    Falls back to *raw_content* unchanged if the API call fails, so that a
+    transient error does not prevent the whole report from being published.
+    """
+    model = llm_config.get("model", DEFAULT_LLM_MODEL)
+    tech_stack = llm_config.get("tech_stack", DEFAULT_LLM_TECH_STACK)
+    focus_areas = llm_config.get("focus_areas", DEFAULT_LLM_FOCUS_AREAS)
+    prompt = _build_llm_prompt(raw_content, tech_stack, focus_areas)
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+    }
+    try:
+        resp = requests.post(
+            OPENAI_API_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+    except (requests.RequestException, KeyError, IndexError) as exc:
+        print(f"⚠️  LLM summarization failed ({exc}); falling back to raw report.", file=sys.stderr)
+        return raw_content
+
+
+# ---------------------------------------------------------------------------
 # Report generation
 # ---------------------------------------------------------------------------
 
@@ -215,8 +288,16 @@ def build_report(
     since: datetime,
     important_labels: list[str] | None = None,
     ai_summary: bool = False,
+    llm_config: dict | None = None,
+    llm_api_key: str = "",
 ) -> str:
-    """Fetch data for every watched repo and return a markdown report."""
+    """Fetch data for every watched repo and return a markdown report.
+
+    When *llm_api_key* is provided and *llm_config* is not None, the releases
+    and issues section for each repository is summarised by an LLM instead of
+    being rendered as raw markdown.
+    """
+    use_llm = bool(llm_api_key and llm_config is not None)
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     since_str = since.strftime("%Y-%m-%d %H:%M UTC")
 
@@ -320,9 +401,12 @@ def build_report(
             sections.append(f"_No merged PRs this week._")
             sections.append(f"")
 
+        # --- Releases + Issues (optionally LLM-summarized) ---
+        raw_lines: list[str] = []
+
         # --- Releases ---
-        sections.append(f"### 🚀 New Releases ({len(releases)})")
-        sections.append(f"")
+        raw_lines.append(f"### 🚀 New Releases ({len(releases)})")
+        raw_lines.append(f"")
         if releases:
             for r in releases:
                 tag = r.get("tag_name", "")
@@ -330,20 +414,20 @@ def build_report(
                 html_url = r.get("html_url", "")
                 pub = r.get("published_at", "")[:10]
                 body = (r.get("body") or "").strip()
-                sections.append(f"#### [{name}]({html_url}) `{tag}` – {pub}")
+                raw_lines.append(f"#### [{name}]({html_url}) `{tag}` – {pub}")
                 if body:
                     # Indent body as a blockquote (trim to 1000 chars to keep issue readable)
                     trimmed = body[:MAX_RELEASE_BODY_LENGTH] + ("…" if len(body) > MAX_RELEASE_BODY_LENGTH else "")
                     for line in trimmed.splitlines():
-                        sections.append(f"> {line}")
-                sections.append(f"")
+                        raw_lines.append(f"> {line}")
+                raw_lines.append(f"")
         else:
-            sections.append(f"_No new releases this week._")
-            sections.append(f"")
+            raw_lines.append(f"_No new releases this week._")
+            raw_lines.append(f"")
 
         # --- Issues ---
-        sections.append(f"### 🐛 重要 Issues ({len(issues)})")
-        sections.append(f"")
+        raw_lines.append(f"### 🐛 重要 Issues ({len(issues)})")
+        raw_lines.append(f"")
         if issues:
             for i in issues:
                 num = i.get("number")
@@ -356,13 +440,20 @@ def build_report(
                 )
                 label_str = f" [{labels}]" if labels else ""
                 state_emoji = "🟢" if state == "open" else "🔴"
-                sections.append(
+                raw_lines.append(
                     f"- {state_emoji} [#{num} {title}]({html_url}){label_str} – {created}"
                 )
+            raw_lines.append(f"")
+        else:
+            raw_lines.append(f"_No new issues this week._")
+            raw_lines.append(f"")
+
+        if use_llm:
+            print(f"🤖 Summarising {full_name} with LLM ...")
+            sections.append(summarize_with_llm("\n".join(raw_lines), llm_config, llm_api_key))  # type: ignore[arg-type]
             sections.append(f"")
         else:
-            sections.append(f"_No new issues this week._")
-            sections.append(f"")
+            sections.extend(raw_lines)
 
         # --- Commit stats ---
         total = commits["total"]
@@ -468,6 +559,7 @@ def main() -> None:
         "important_labels", ["bug", "enhancement", "breaking change", "priority/high"]
     )
     ai_summary_enabled: bool = bool(config.get("ai_summary", False))
+    llm_config: dict | None = config.get("llm") or None
 
     # Allow env var to override lookback_days (used by workflow_dispatch)
     if os.environ.get("LOOKBACK_DAYS"):
@@ -490,10 +582,18 @@ def main() -> None:
 
     print(f"Fetching activity since {since.isoformat()} ...")
 
+    llm_api_key = os.environ.get("OPENAI_API_KEY", "")
+    if llm_api_key and llm_config is not None:
+        print(f"🤖 LLM summarization enabled (model: {llm_config.get('model', DEFAULT_LLM_MODEL)})")
+    else:
+        print("ℹ️  LLM summarization disabled – set OPENAI_API_KEY and configure 'llm' in config.json to enable.")
+
     report_body = build_report(
         watch_repos, token, since,
         important_labels=important_labels or None,
         ai_summary=ai_summary_enabled,
+        llm_config=llm_config,
+        llm_api_key=llm_api_key,
     )
 
     now = datetime.now(timezone.utc)

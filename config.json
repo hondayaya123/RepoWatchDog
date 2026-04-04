@@ -12,5 +12,10 @@
   },
   "lookback_days": 7,
   "important_labels": ["bug", "enhancement", "breaking change", "priority/high"],
-  "ai_summary": true
+  "ai_summary": true,
+  "llm": {
+    "model": "gpt-4o-mini",
+    "tech_stack": "general software development",
+    "focus_areas": "breaking changes, new features, performance improvements, security vulnerabilities"
+  }
 }

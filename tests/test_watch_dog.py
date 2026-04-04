@@ -14,6 +14,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from watch_dog import (
+    _build_llm_prompt,
     _parse_dt,
     build_report,
     fetch_commit_stats,
@@ -22,6 +23,7 @@ from watch_dog import (
     generate_ai_summary,
     load_state,
     save_state,
+    summarize_with_llm,
 )
 
 
@@ -550,3 +552,102 @@ def test_lookback_days_env_override(tmp_path, monkeypatch):
     # 'since' should be clamped to ~14 days ago (not 30)
     diff = datetime.now(timezone.utc) - captured["since"]
     assert 13 <= diff.days <= 15
+
+
+# ---------------------------------------------------------------------------
+# LLM summarization
+# ---------------------------------------------------------------------------
+
+
+def test_build_llm_prompt_contains_sections():
+    prompt = _build_llm_prompt("some raw content", "React, Node.js", "breaking changes")
+    assert "🔥" in prompt
+    assert "✨" in prompt
+    assert "🛠️" in prompt
+    assert "💡" in prompt
+    assert "React, Node.js" in prompt
+    assert "breaking changes" in prompt
+    assert "some raw content" in prompt
+
+
+def _make_llm_response(content: str):
+    mock = MagicMock()
+    mock.json.return_value = {"choices": [{"message": {"content": content}}]}
+    mock.raise_for_status = MagicMock()
+    return mock
+
+
+@patch("watch_dog.requests.post")
+def test_summarize_with_llm_success(mock_post):
+    mock_post.return_value = _make_llm_response("🔥 重大變更\n✨ 重點新功能")
+
+    llm_config = {"model": "gpt-4o-mini", "tech_stack": "Python", "focus_areas": "security"}
+    result = summarize_with_llm("raw data", llm_config, "fake-key")
+
+    assert "🔥 重大變更" in result
+    assert "✨ 重點新功能" in result
+    mock_post.assert_called_once()
+    call_kwargs = mock_post.call_args
+    assert "Bearer fake-key" in call_kwargs[1]["headers"]["Authorization"]
+
+
+@patch("watch_dog.requests.post")
+def test_summarize_with_llm_fallback_on_error(mock_post):
+    import requests as req
+    mock_post.side_effect = req.exceptions.ConnectionError("network error")
+
+    result = summarize_with_llm("raw data", {}, "fake-key")
+    assert result == "raw data"
+
+
+@patch("watch_dog.requests.get")
+@patch("watch_dog.requests.post")
+def test_build_report_with_llm(mock_post, mock_get):
+    since = datetime(2024, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
+    watch_repos = [{"owner": "example", "repo": "repo", "description": "Test repo"}]
+
+    mock_get.side_effect = [
+        _make_response([MOCK_PR]),      # merged PRs page 1
+        _make_response([]),             # merged PRs page 2
+        _make_response([MOCK_RELEASE]), # releases page 1
+        _make_response([]),             # releases page 2
+        _make_response([MOCK_ISSUE]),   # issues page 1
+        _make_response([]),             # issues page 2
+        _make_response([MOCK_COMMIT]),  # commits page 1
+        _make_response([]),             # commits page 2
+    ]
+
+    llm_summary = "🔥 重大變更: 無\n✨ 重點新功能: 新增功能\n🛠️ 效能與修復: 修復 bug\n💡 專家建議: 立刻更新"
+    mock_post.return_value = _make_llm_response(llm_summary)
+
+    llm_config = {"model": "gpt-4o-mini", "tech_stack": "Python", "focus_areas": "breaking changes"}
+    report = build_report(watch_repos, token="fake", since=since, llm_config=llm_config, llm_api_key="fake-key")
+
+    assert "RepoWatchDog Weekly Summary" in report
+    assert "example/repo" in report
+    assert "🔥 重大變更" in report
+    assert "💡 專家建議" in report
+    mock_post.assert_called_once()
+
+
+@patch("watch_dog.requests.get")
+def test_build_report_without_llm_key_uses_raw(mock_get):
+    """When no LLM key is provided, the raw markdown report is used."""
+    since = datetime(2024, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
+    watch_repos = [{"owner": "example", "repo": "repo", "description": "Test repo"}]
+
+    mock_get.side_effect = [
+        _make_response([]),             # merged PRs – empty
+        _make_response([MOCK_RELEASE]), # releases page 1
+        _make_response([]),             # releases page 2
+        _make_response([MOCK_ISSUE]),   # issues page 1
+        _make_response([]),             # issues page 2
+        _make_response([]),             # commits – empty
+    ]
+
+    llm_config = {"model": "gpt-4o-mini"}
+    report = build_report(watch_repos, token="fake", since=since, llm_config=llm_config, llm_api_key="")
+
+    # Raw release and issue info should appear
+    assert "v1.2.3" in report
+    assert "Something is broken" in report

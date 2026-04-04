@@ -38,6 +38,7 @@ jobs:
           REPORT_OWNER: ${{ github.repository_owner }}
           REPORT_REPO: ${{ github.event.repository.name }}
           LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python scripts/watch_dog.py
 
       - name: Commit updated state
