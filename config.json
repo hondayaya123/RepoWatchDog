@@ -10,5 +10,7 @@
     "owner": "",
     "repo": ""
   },
-  "lookback_days": 7
+  "lookback_days": 7,
+  "important_labels": ["bug", "enhancement", "breaking change", "priority/high"],
+  "ai_summary": true
 }
