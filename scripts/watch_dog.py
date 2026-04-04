@@ -464,6 +464,79 @@ def _user_item_label(item: dict, item_type: str) -> str:
     return item.get("title") or ""
 
 
+def _extract_item_summary(item: dict, item_type: str, max_chars: int = 120) -> str:
+    """Return a brief Traditional-Chinese summary description for the item.
+
+    For releases the body is used; for PRs/issues the body or title-based
+    keyword heuristics are applied.  The result is always a short plain-text
+    string suitable for display as a single indented note line.
+    """
+    body: str = (item.get("body") or "").strip()
+    labels: list[str] = [lbl["name"] for lbl in item.get("labels", [])]
+    title: str = item.get("title") or item.get("name") or item.get("tag_name") or ""
+
+    # --- Build a context note from labels ---
+    label_notes: list[str] = []
+    for lbl in labels:
+        lbl_lower = lbl.lower()
+        if lbl_lower in ("bug",):
+            label_notes.append("錯誤修復")
+        elif lbl_lower in ("enhancement", "feature"):
+            label_notes.append("功能強化")
+        elif lbl_lower in ("breaking change", "breaking-change"):
+            label_notes.append("破壞性變更")
+        elif lbl_lower in ("security",):
+            label_notes.append("安全性修補")
+        elif lbl_lower in ("documentation", "docs"):
+            label_notes.append("文件更新")
+        elif lbl_lower in ("performance",):
+            label_notes.append("效能優化")
+        elif lbl_lower in ("priority/high",):
+            label_notes.append("高優先度")
+
+    # --- Extract a meaningful snippet from the body ---
+    snippet = ""
+    if body:
+        # Take the first non-empty line that is not a markdown heading or HTML tag
+        for line in body.splitlines():
+            line = line.strip()
+            # Skip markdown headings, horizontal rules, and HTML tags
+            if not line or line.startswith("#") or line.startswith("---") or line.startswith("<"):
+                continue
+            # Strip leading markdown list markers and blockquote chars
+            line = line.lstrip("-*> ").strip()
+            if len(line) < 5:
+                continue
+            snippet = line
+            break
+        if snippet and len(snippet) > max_chars:
+            snippet = snippet[:max_chars] + "…"
+
+    # --- Assemble the summary ---
+    parts: list[str] = []
+    if label_notes:
+        parts.append("、".join(label_notes))
+    if snippet:
+        parts.append(snippet)
+    elif not label_notes:
+        # Fall back to keyword hints from the title
+        text = title.lower()
+        if "security" in text or "cve" in text:
+            parts.append("安全性漏洞修補，請儘速更新")
+        elif "deprecat" in text:
+            parts.append("功能已標記為廢棄，請規劃遷移")
+        elif "breaking" in text or "remove" in text or "removed" in text:
+            parts.append("有破壞性變更，升級前請確認相容性")
+        elif "bug" in text or "fix" in text or "crash" in text:
+            parts.append("錯誤修復")
+        elif "feature" in text or "add" in text or "new" in text:
+            parts.append("新增功能或改善")
+        elif item_type == "release":
+            parts.append("新版本發布")
+
+    return "　".join(parts) if parts else ""
+
+
 def _generate_user_tips(
     new_features: list[dict],
     known_issues: list[dict],
@@ -585,6 +658,9 @@ def build_compact_report(
                 label = "功能改善"
                 icon = "🔧"
             sections.append(f"- {icon} **【{label}】** [{title}]({url})（來源：{repo_label}）")
+            summary_note = _extract_item_summary(item, item_type)
+            if summary_note:
+                sections.append(f"  > {summary_note}")
         sections.append("")
 
     # ── ⚠️ 已知問題 ──────────────────────────────────────────────────────────
@@ -602,6 +678,9 @@ def build_compact_report(
             url = item.get("html_url", "")
             repo_label = item.get("_repo", "")
             sections.append(f"- ❗ **【已知錯誤】** [{title}]({url})（來源：{repo_label}）")
+            summary_note = _extract_item_summary(item, item_type)
+            if summary_note:
+                sections.append(f"  > {summary_note}")
         sections.append("")
 
     # ── 🚫 目前不支援 / 限制 ──────────────────────────────────────────────────
@@ -619,6 +698,9 @@ def build_compact_report(
             url = item.get("html_url", "")
             repo_label = item.get("_repo", "")
             sections.append(f"- 🚫 **【功能限制】** [{title}]({url})（來源：{repo_label}）")
+            summary_note = _extract_item_summary(item, item_type)
+            if summary_note:
+                sections.append(f"  > {summary_note}")
         sections.append("")
 
     # ── 💡 本週小結 ──────────────────────────────────────────────────────────
