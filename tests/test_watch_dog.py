@@ -15,9 +15,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from watch_dog import (
     _build_llm_prompt,
+    _classify_for_user,
     _compute_severity,
     _is_major_version_bump,
     _parse_dt,
+    _user_classify_text,
     build_compact_report,
     build_report,
     fetch_commit_stats,
@@ -827,17 +829,20 @@ def test_build_compact_report_structure(mock_get):
     report = build_compact_report(watch_repos, token="fake", since=since)
 
     assert "# 📦 RepoWatchDog 週報摘要" in report
-    assert "## 🔥 重大變更" in report
-    assert "## 🛡️ 風險與注意事項" in report
-    assert "## ✅ 建議行動" in report
-    # At least one action item checkbox
-    assert "- [ ]" in report
+    assert "## ✨ 本週新功能 / 改善" in report
+    assert "## ⚠️ 已知問題（使用中可能遇到）" in report
+    assert "## 🚫 目前不支援 / 限制" in report
+    assert "## 💡 本週小結" in report
+    # Items should have Chinese category labels
+    assert "【新版本】" in report or "【功能改善】" in report or "【功能規劃中】" in report
     # Summary line should be in Traditional Chinese
     assert "本週監測" in report
+    # Footer should be in Chinese
+    assert "自動產生" in report
 
 
 @patch("watch_dog.requests.get")
-def test_build_compact_report_no_critical_changes(mock_get):
+def test_build_compact_report_no_activity(mock_get):
     since = datetime(2024, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
     watch_repos = [{"owner": "example", "repo": "repo", "description": "Test repo"}]
 
@@ -852,6 +857,104 @@ def test_build_compact_report_no_critical_changes(mock_get):
 
     report = build_compact_report(watch_repos, token="fake", since=since)
 
-    assert "本週無重大變更" in report
-    assert "## 🔥 重大變更" in report
+    assert "## ✨ 本週新功能 / 改善" in report
+    assert "## ⚠️ 已知問題（使用中可能遇到）" in report
+    assert "_本週無已知問題回報。_" in report
+
+
+# ---------------------------------------------------------------------------
+# _user_classify_text
+# ---------------------------------------------------------------------------
+
+
+def test_user_classify_text_feature():
+    assert _user_classify_text("FEATURE: Subagent skills", []) == "feature"
+
+
+def test_user_classify_text_feature_via_label():
+    assert _user_classify_text("Some PR", ["enhancement"]) == "feature"
+
+
+def test_user_classify_text_bug():
+    assert _user_classify_text("BUG: Task tool crashes", []) == "bug"
+
+
+def test_user_classify_text_bug_label():
+    assert _user_classify_text("Something is broken", ["bug"]) == "bug"
+
+
+def test_user_classify_text_unsupported():
+    assert _user_classify_text("view tool doesn't work with BYOM", []) == "unsupported"
+
+
+def test_user_classify_text_unsupported_keyword():
+    assert _user_classify_text("Feature not support for this provider", []) == "unsupported"
+
+
+def test_user_classify_text_other():
+    assert _user_classify_text("Update README", []) == "other"
+
+
+def test_user_classify_text_unsupported_wins_over_feature():
+    # "unsupported" is checked before "feature" so that titles like
+    # "Add support for BYOM – not support yet" correctly land in the
+    # limitations bucket rather than the new-features bucket.
+    assert _user_classify_text("Add support for BYOM – not support yet", []) == "unsupported"
+
+
+# ---------------------------------------------------------------------------
+# _classify_for_user
+# ---------------------------------------------------------------------------
+
+
+def test_classify_for_user_releases_are_new_features():
+    features, issues, unsupported = _classify_for_user(
+        releases=[MOCK_RELEASE], prs=[], issues=[]
+    )
+    assert len(features) == 1
+    assert features[0]["type"] == "release"
+    assert issues == []
+    assert unsupported == []
+
+
+def test_classify_for_user_bug_issue_goes_to_known_issues():
+    bug_issue = {**MOCK_ISSUE, "title": "BUG: Something crashes", "labels": [{"name": "bug"}]}
+    features, issues, unsupported = _classify_for_user(
+        releases=[], prs=[], issues=[bug_issue]
+    )
+    assert len(issues) == 1
+    assert features == []
+    assert unsupported == []
+
+
+def test_classify_for_user_unsupported_issue():
+    ns_issue = {**MOCK_ISSUE, "title": "view tool doesn't work with BYOM", "labels": []}
+    features, issues, unsupported = _classify_for_user(
+        releases=[], prs=[], issues=[ns_issue]
+    )
+    assert len(unsupported) == 1
+    assert features == []
+    assert issues == []
+
+
+def test_classify_for_user_feature_issue():
+    feat_issue = {**MOCK_ISSUE, "title": "FEATURE: Add new skill system", "labels": []}
+    features, issues, unsupported = _classify_for_user(
+        releases=[], prs=[], issues=[feat_issue]
+    )
+    assert len(features) == 1
+    assert features[0]["type"] == "issue"
+    assert issues == []
+
+
+def test_classify_for_user_respects_max_items():
+    many_issues = [
+        {**MOCK_ISSUE, "number": i, "title": f"BUG: crash #{i}", "labels": [{"name": "bug"}]}
+        for i in range(15)
+    ]
+    features, issues, unsupported = _classify_for_user(
+        releases=[], prs=[], issues=many_issues, max_items=5
+    )
+    assert len(issues) == 5
+
 

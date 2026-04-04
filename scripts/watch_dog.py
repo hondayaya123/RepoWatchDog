@@ -54,6 +54,21 @@ _BREAKING_KEYWORDS: dict[str, int] = {
 
 MAX_COMPACT_ITEMS = 10
 
+# Keywords used to classify items from a user perspective (case-insensitive substring match)
+_FEATURE_KEYWORDS: tuple[str, ...] = (
+    "feature", "feat", "new feature", "add support",
+    "enable", "implement", "introduce", "enhance", "enhancement", "improve",
+)
+_BUG_KEYWORDS: tuple[str, ...] = (
+    "bug", "broken", "fail", "crash", "not work",
+    "never trigger", "doesn't fire", "not firing", "incorrect", "wrong",
+    "sends image as text", "underestimate",
+)
+_UNSUPPORTED_KEYWORDS: tuple[str, ...] = (
+    "not support", "unsupported", "byom", "doesn't work with",
+    "missing support", "no support",
+)
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -369,14 +384,125 @@ def _generate_actions(
     return actions[:3]
 
 
+# ---------------------------------------------------------------------------
+# User-perspective classification helpers
+# ---------------------------------------------------------------------------
+
+
+def _user_classify_text(title: str, labels: list[str]) -> str:
+    """Classify an item as 'feature', 'bug', 'unsupported', or 'other'.
+
+    Returns one of: ``'feature'``, ``'bug'``, ``'unsupported'``, ``'other'``.
+    """
+    text = (title + " " + " ".join(labels)).lower()
+    if any(kw in text for kw in _UNSUPPORTED_KEYWORDS):
+        return "unsupported"
+    if any(kw in text for kw in _FEATURE_KEYWORDS):
+        return "feature"
+    if any(kw in text for kw in _BUG_KEYWORDS):
+        return "bug"
+    return "other"
+
+
+def _classify_for_user(
+    releases: list[dict],
+    prs: list[dict],
+    issues: list[dict],
+    max_items: int = MAX_COMPACT_ITEMS,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Categorize items into new features, known issues, and unsupported items.
+
+    Returns:
+        A tuple of (new_features, known_issues, not_supported) where each is
+        a list of dicts with keys ``type`` and ``item``.
+    """
+    new_features: list[dict] = []
+    known_issues: list[dict] = []
+    not_supported: list[dict] = []
+
+    # All releases are "new features / improvements" from a user perspective
+    for r in releases:
+        new_features.append({"type": "release", "item": r})
+
+    # PRs: classify by title/labels
+    for pr in prs:
+        title = pr.get("title") or ""
+        labels = [lbl["name"] for lbl in pr.get("labels", [])]
+        kind = _user_classify_text(title, labels)
+        if kind == "bug":
+            known_issues.append({"type": "pr", "item": pr})
+        elif kind == "unsupported":
+            not_supported.append({"type": "pr", "item": pr})
+        else:  # feature or other PRs are improvements
+            new_features.append({"type": "pr", "item": pr})
+
+    # Issues: classify by title/labels
+    for issue in issues:
+        title = issue.get("title") or ""
+        labels = [lbl["name"] for lbl in issue.get("labels", [])]
+        kind = _user_classify_text(title, labels)
+        if kind == "unsupported":
+            not_supported.append({"type": "issue", "item": issue})
+        elif kind == "feature":
+            new_features.append({"type": "issue", "item": issue})
+        else:  # bug or other issues affect user experience
+            known_issues.append({"type": "issue", "item": issue})
+
+    return (
+        new_features[:max_items],
+        known_issues[:max_items],
+        not_supported[:max_items],
+    )
+
+
+def _user_item_label(item: dict, item_type: str) -> str:
+    """Return a display title for the given item."""
+    if item_type == "release":
+        tag = item.get("tag_name", "")
+        name = item.get("name") or tag
+        return f"{name}" if name == tag else f"{name} ({tag})"
+    return item.get("title") or ""
+
+
+def _generate_user_tips(
+    new_features: list[dict],
+    known_issues: list[dict],
+    not_supported: list[dict],
+    all_releases: list[dict],
+) -> list[str]:
+    """Return up to 3 user-friendly tips based on this week's activity."""
+    tips: list[str] = []
+
+    release_count = sum(1 for f in new_features if f["type"] == "release")
+    if release_count > 0:
+        tips.append(f"本週有 {release_count} 個新版本發布，建議更新以取得最新功能與修復")
+
+    feature_issues = sum(1 for f in new_features if f["type"] == "issue")
+    if feature_issues > 0:
+        tips.append(f"有 {feature_issues} 項新功能正在規劃中，可追蹤相關 Issue 了解進展")
+
+    if known_issues:
+        tips.append(f"本週有 {len(known_issues)} 個已知問題，如遇到相關錯誤可查閱上方連結確認是否為已知問題")
+
+    if not_supported:
+        tips.append(f"有 {len(not_supported)} 項功能目前有限制，使用前請留意")
+
+    if not tips:
+        tips.append("本週無顯著變化，持續追蹤後續更新即可")
+
+    return tips[:3]
+
+
 def build_compact_report(
     watch_repos: list[dict],
     token: str,
     since: datetime,
     important_labels: list[str] | None = None,
 ) -> str:
-    """Build a compact Traditional-Chinese report highlighting only critical changes.
+    """Build a compact Traditional-Chinese user-perspective summary report.
 
+    Focuses on what's new, what's broken, and what's not supported –
+    written for end users rather than developers.
     No LLM or paid API is required – all logic is rule-based.
     """
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -406,26 +532,24 @@ def build_compact_report(
         except requests.HTTPError as exc:
             print(f"⚠️ Failed to fetch {owner}/{repo}: {exc}", file=sys.stderr)
 
-    critical = filter_critical_changes(all_releases, all_prs, all_issues)
+    new_features, known_issues, not_supported = _classify_for_user(
+        all_releases, all_prs, all_issues
+    )
     total_changes = len(all_releases) + len(all_prs) + len(all_issues)
     repos_str = "、".join(f"{e['owner']}/{e['repo']}" for e in watch_repos)
 
-    # One-line summary
-    if not critical:
-        summary = f"本週監測 {repos_str}，共 {total_changes} 項更新，**無發現重大變更**。"
+    # One-line summary (user perspective)
+    parts: list[str] = []
+    if new_features:
+        parts.append(f"{len(new_features)} 項新功能或改善")
+    if known_issues:
+        parts.append(f"{len(known_issues)} 個已知問題")
+    if not_supported:
+        parts.append(f"{len(not_supported)} 項功能限制")
+    if parts:
+        summary = f"本週監測 {repos_str}，共 {total_changes} 項更新，包含 {'、'.join(parts)}。"
     else:
-        sev3 = sum(1 for c in critical if c["severity"] >= 3)
-        sev2 = sum(1 for c in critical if c["severity"] == 2)
-        rest = len(critical) - sev3 - sev2
-        parts: list[str] = []
-        if sev3:
-            parts.append(f"{sev3} 項安全性問題")
-        if sev2:
-            parts.append(f"{sev2} 項破壞性變更")
-        if rest:
-            parts.append(f"{rest} 項重要更新")
-        changes_summary = "、".join(parts)
-        summary = f"本週監測 {repos_str}，共 {total_changes} 項更新，發現 {changes_summary}，請優先處理。"
+        summary = f"本週監測 {repos_str}，共 {total_changes} 項更新，本週無顯著變化。"
 
     sections: list[str] = [
         "# 📦 RepoWatchDog 週報摘要",
@@ -437,57 +561,77 @@ def build_compact_report(
         "",
     ]
 
-    # ── 🔥 重大變更 ──────────────────────────────────────────────────────────
-    sections.append("## 🔥 重大變更")
+    # ── ✨ 新功能 / 改善 ──────────────────────────────────────────────────────
+    sections.append("## ✨ 本週新功能 / 改善")
     sections.append("")
 
-    if not critical:
-        sections.append("_本週無重大變更。_")
+    if not new_features:
+        sections.append("_本週無新功能或改善。_")
         sections.append("")
     else:
-        for idx, entry in enumerate(critical, 1):
+        for entry in new_features:
             item = entry["item"]
             item_type = entry["type"]
-            severity = entry["severity"]
-
-            title = item.get("title") or item.get("name") or item.get("tag_name") or ""
+            title = _user_item_label(item, item_type)
             url = item.get("html_url", "")
             repo_label = item.get("_repo", "")
-
-            if severity >= 3:
-                badge = "🔴 安全"
-            elif severity == 2:
-                badge = "🟠 破壞性"
+            if item_type == "release":
+                label = "新版本"
+                icon = "🆕"
+            elif item_type == "issue":
+                label = "功能規劃中"
+                icon = "💡"
             else:
-                badge = "🟡 重要"
+                label = "功能改善"
+                icon = "🔧"
+            sections.append(f"- {icon} **【{label}】** [{title}]({url})（來源：{repo_label}）")
+        sections.append("")
 
-            impact, action = _get_impact_and_action(item, item_type, severity)
-
-            sections.append(f"### {idx}. [{badge}] {title}")
-            sections.append("")
-            sections.append(f"- **影響：** {impact}")
-            sections.append(f"- **我需要做：** {action}")
-            sections.append(f"- **參考連結：** [{repo_label}]({url})")
-            sections.append("")
-
-    # ── 🛡️ 風險與注意事項 ────────────────────────────────────────────────────
-    sections.append("## 🛡️ 風險與注意事項")
-    sections.append("")
-    for i, risk in enumerate(_generate_risks(critical, all_releases), 1):
-        sections.append(f"{i}. {risk}")
+    # ── ⚠️ 已知問題 ──────────────────────────────────────────────────────────
+    sections.append("## ⚠️ 已知問題（使用中可能遇到）")
     sections.append("")
 
-    # ── ✅ 建議行動 checklist ─────────────────────────────────────────────────
-    sections.append("## ✅ 建議行動")
+    if not known_issues:
+        sections.append("_本週無已知問題回報。_")
+        sections.append("")
+    else:
+        for entry in known_issues:
+            item = entry["item"]
+            item_type = entry["type"]
+            title = _user_item_label(item, item_type)
+            url = item.get("html_url", "")
+            repo_label = item.get("_repo", "")
+            sections.append(f"- ❗ **【已知錯誤】** [{title}]({url})（來源：{repo_label}）")
+        sections.append("")
+
+    # ── 🚫 目前不支援 / 限制 ──────────────────────────────────────────────────
+    sections.append("## 🚫 目前不支援 / 限制")
     sections.append("")
-    for action_item in _generate_actions(critical, all_releases, all_prs, all_issues):
-        sections.append(f"- [ ] {action_item}")
+
+    if not not_supported:
+        sections.append("_本週無功能限制回報。_")
+        sections.append("")
+    else:
+        for entry in not_supported:
+            item = entry["item"]
+            item_type = entry["type"]
+            title = _user_item_label(item, item_type)
+            url = item.get("html_url", "")
+            repo_label = item.get("_repo", "")
+            sections.append(f"- 🚫 **【功能限制】** [{title}]({url})（來源：{repo_label}）")
+        sections.append("")
+
+    # ── 💡 本週小結 ──────────────────────────────────────────────────────────
+    sections.append("## 💡 本週小結")
+    sections.append("")
+    for tip in _generate_user_tips(new_features, known_issues, not_supported, all_releases):
+        sections.append(f"- {tip}")
     sections.append("")
 
     sections.append("---")
     sections.append("")
     sections.append(
-        "_Generated by [RepoWatchDog](https://github.com/hondayaya123/RepoWatchDog)_ 🐶"
+        "_由 [RepoWatchDog](https://github.com/hondayaya123/RepoWatchDog) 自動產生_ 🐶"
     )
 
     return "\n".join(sections)
