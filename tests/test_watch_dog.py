@@ -15,9 +15,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from watch_dog import (
     _build_llm_prompt,
+    _classify_for_user,
     _compute_severity,
     _is_major_version_bump,
     _parse_dt,
+    _user_classify_text,
     build_compact_report,
     build_report,
     fetch_commit_stats,
